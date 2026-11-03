@@ -23,6 +23,7 @@ import {
 } from './service-bot-session.js';
 import { resolveBcsSessionCleanupConfig, startBcsSessionCleanup } from './session-cleanup.js';
 import type { ResolvedBcsAccount } from './types.js';
+import { SessionMutationCoordinator } from './session-mutation-coordinator.js';
 
 const CHANNEL_ID = 'bcs';
 
@@ -53,6 +54,7 @@ function waitUntilAbort(signal?: AbortSignal, onAbort?: () => void): Promise<voi
 
 /** Active WS clients per account for status probing. */
 const activeClients = new Map<string, BcsWsClient>();
+const sessionMutationCoordinator = new SessionMutationCoordinator();
 
 /** Whether agent events subscription has been initialized */
 let agentEventsInitialized = false;
@@ -267,9 +269,9 @@ export function createBcsPlugin(options: BcsChannelPluginOptions = {}) {
         });
 
         // Register request handlers
-        client.onRequest('chat.send', req => handleChatSend(req, client, account, log));
+        client.onRequest('chat.send', req => handleChatSend(req, client, account, log, sessionMutationCoordinator));
         client.onRequest('chat.abort', req => handleChatAbort(req, client, log));
-        client.onRequest('chat.inject', req => handleChatInject(req, client, account, log, dataDir));
+        client.onRequest('chat.inject', req => handleChatInject(req, client, account, log, dataDir, sessionMutationCoordinator));
         client.onRequest('chat.history', req => handleChatHistory(req, client, account, log, dataDir));
         client.onRequest('session.delete', req => handleSessionDelete(req, client, account, log, dataDir));
 
@@ -299,6 +301,7 @@ export function createBcsPlugin(options: BcsChannelPluginOptions = {}) {
             // Set up reconnection on unexpected close
             client.onClose((code, reason) => {
               log?.warn?.(`BCS WebSocket closed: code=${code} reason=${reason}`);
+              sessionMutationCoordinator.restart(account.botId);
               if (!ctx.abortSignal?.aborted) {
                 scheduleReconnect();
               }
@@ -319,6 +322,7 @@ export function createBcsPlugin(options: BcsChannelPluginOptions = {}) {
             reconnectTimer = null;
           }
           abortAllStreams();
+          sessionMutationCoordinator.restart(account.botId);
           // Fire-and-forget disconnect; stopAccount also handles cleanup
           client.disconnect().catch(err => {
             log?.warn?.(`Error during BCS disconnect: ${err}`);
@@ -340,6 +344,8 @@ export function createBcsPlugin(options: BcsChannelPluginOptions = {}) {
           await client.disconnect();
           activeClients.delete(ctx.accountId ?? 'default');
         }
+        const stoppedAccount = resolveBcsAccount(ctx.cfg, ctx.accountId);
+        sessionMutationCoordinator.restart(stoppedAccount.botId);
         ctx.log?.info?.(`BCS account ${ctx.accountId} stopped`);
 
         // Cleanup agent events subscription if no more active clients

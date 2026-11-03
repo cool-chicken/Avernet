@@ -15,6 +15,10 @@ import * as path from 'node:path';
 import type { BcsWsClient } from './bcs-ws-client.js';
 import { resolveGatewayPort, scopesForGatewayMethod } from './gateway-security.js';
 import { getBcsRuntime } from './runtime.js';
+import {
+  SessionCoordinatorBusyError,
+  SessionMutationCoordinator,
+} from './session-mutation-coordinator.js';
 import type {
   RequestFrame,
   ChatSendParams,
@@ -53,6 +57,8 @@ const FILE_DOWNLOAD_TIMEOUT_MS = 60_000;
 const FILE_READ_IDLE_TIMEOUT_MS = 15_000;
 const RUN_TERMINAL_TIMEOUT_MS = 15 * 60 * 1000;
 const INJECT_ASSISTANT_ONLY_FIELDS = [ 'api', 'provider', 'model', 'stopReason', 'usage' ];
+const DEFAULT_INJECT_WAIT_TIMEOUT_MS = 15_000;
+const defaultSessionMutationCoordinator = new SessionMutationCoordinator();
 
 /** Extract sender name from [from:botName] prefix. Returns stripped text and sender name. */
 function extractFromPrefix(raw: string): { senderName: string; text: string } {
@@ -201,6 +207,8 @@ const activeStreams = new Map<string, AbortController>();
 type RunContext = {
   groupId: string;
   bcsSessionId: string;
+  botId: string;
+  coordinator: SessionMutationCoordinator;
   client: BcsWsClient;
   abortSessionKey: string;
   sessionKey?: string;
@@ -535,12 +543,26 @@ function bindAgentRun(
 function cleanupRunContext(
   runId: string,
   log?: { info: (...args: unknown[]) => void },
+  terminalConfirmed = false,
 ): Promise<void> {
   const existingCleanup = cleanupPromiseByRunId.get(runId);
   if (existingCleanup) return existingCleanup;
 
   const context = runContexts.get(runId);
   if (!context) return Promise.resolve();
+
+  if (context.sessionKey) {
+    const identity = {
+      botId: context.botId,
+      canonicalSessionKey: context.sessionKey,
+      bcsRunId: runId,
+      ...(context.agentRunId ? { agentRunId: context.agentRunId } : {}),
+    };
+    if (!context.coordinator.complete(identity, terminalConfirmed)) {
+      log?.info?.(`[BCS] Retaining run context until terminal confirmation for run_id=${runId}`);
+      return Promise.resolve();
+    }
+  }
 
   if (context.terminalState) {
     terminalRuns.set(runId, {
@@ -591,14 +613,22 @@ function armRunTerminalTimeout(
   if (!context) return;
 
   const timer = setTimeout(() => {
-    if (!runContexts.has(runId)) return;
+    const context = runContexts.get(runId);
+    if (!context) return;
     sendRunErrorOnce(
       runId,
       'Agent response timed out before completion.',
       log,
       `terminal lifecycle timeout after ${RUN_TERMINAL_TIMEOUT_MS}ms`,
     );
-    void cleanupRunContext(runId, log);
+    if (context.sessionKey) {
+      context.coordinator.markTimedOut({
+        botId: context.botId,
+        canonicalSessionKey: context.sessionKey,
+        bcsRunId: runId,
+        ...(context.agentRunId ? { agentRunId: context.agentRunId } : {}),
+      });
+    }
   }, RUN_TERMINAL_TIMEOUT_MS);
   timer.unref?.();
   context.terminalTimer = timer;
@@ -1261,6 +1291,14 @@ export async function handleChatAbort(
   // competing final/error event.
   context.finalSent = true;
   context.terminalState = 'aborted';
+  if (context.sessionKey) {
+    context.coordinator.abort({
+      botId: context.botId,
+      canonicalSessionKey: context.sessionKey,
+      bcsRunId: runId,
+      ...(context.agentRunId ? { agentRunId: context.agentRunId } : {}),
+    });
+  }
   sendVisibleReplyDelta(runId, log);
   controller.abort();
   context.client.sendEvent(
@@ -1272,7 +1310,8 @@ export async function handleChatAbort(
     aborted_run_ids: [ runId ],
   });
   log?.info?.(`[BCS] Aborted exact run_id=${runId}`);
-  await cleanupRunContext(runId, log);
+  // Keep the run context until the terminal lifecycle (or the existing
+  // terminal timeout) arrives so the Session owner is not released early.
 }
 
 /** Extract GroupContext from params for logging/context. */
@@ -1354,6 +1393,7 @@ export async function handleChatSend(
   client: BcsWsClient,
   account: ResolvedBcsAccount,
   log?: { info: (...args: unknown[]) => void; warn: (...args: unknown[]) => void; error: (...args: unknown[]) => void },
+  coordinator: SessionMutationCoordinator = defaultSessionMutationCoordinator,
 ): Promise<void> {
   const params = request.params as unknown as ChatSendParams;
   const bcsGroupId = params.bcs_group_id;
@@ -1409,6 +1449,8 @@ export async function handleChatSend(
   runContexts.set(runId, {
     groupId: bcsGroupId,
     bcsSessionId,
+    botId: account.botId,
+    coordinator,
     client,
     abortSessionKey,
     sawToolEvent: false,
@@ -1416,9 +1458,32 @@ export async function handleChatSend(
   });
   ensureVisibleReplyState(runId);
   armRunTerminalTimeout(runId, log);
-  client.sendResponse(request.id, true, { run_id: runId });
 
   try {
+    const requestedSessionKey = nonEmptyString(params.bcs_session_id)
+      || nonEmptyString(params.session_key)
+      || `pending-${runId}`;
+    try {
+      coordinator.reserve({
+        botId: account.botId,
+        canonicalSessionKey: requestedSessionKey,
+        bcsRunId: runId,
+      });
+    } catch (error) {
+      if (error instanceof SessionCoordinatorBusyError) {
+        client.sendResponse(request.id, false, undefined, {
+          code: error.code,
+          message: error.message,
+          retryable: error.retryable,
+        });
+        await cleanupRunContext(runId, log, true);
+        return;
+      }
+      throw error;
+    }
+    runContexts.get(runId)!.sessionKey = requestedSessionKey;
+    client.sendResponse(request.id, true, { run_id: runId });
+
     const rt = getBcsRuntime();
     const currentCfg = withBcsDirectSessionScope(await rt.config.loadConfig());
     const preparedImages = await prepareImageAttachments({
@@ -1454,6 +1519,29 @@ export async function handleChatSend(
     const runContext = runContexts.get(runId);
     if (runContext) {
       runContext.sessionKey = route.sessionKey;
+    }
+
+    try {
+      coordinator.rekey({
+        botId: account.botId,
+        canonicalSessionKey: requestedSessionKey,
+        bcsRunId: runId,
+      }, {
+        botId: account.botId,
+        canonicalSessionKey: route.sessionKey,
+      });
+    } catch (error) {
+      if (error instanceof SessionCoordinatorBusyError) {
+        sendRunErrorOnce(runId, error.message, log, error.code);
+        coordinator.complete({
+          botId: account.botId,
+          canonicalSessionKey: requestedSessionKey,
+          bcsRunId: runId,
+        });
+        await cleanupRunContext(runId, log, true);
+        return;
+      }
+      throw error;
     }
 
     // Record bidirectional mapping: sessionKey <-> bcsGroupId
@@ -1568,18 +1656,28 @@ export async function handleChatSend(
         sourceReplyDeliveryMode: 'automatic',
         onAgentRunStart: (agentRunId: string) => {
           bindAgentRun(runId, agentRunId, log);
+          const current = runContexts.get(runId);
+          if (current?.sessionKey) {
+            coordinator.bindAgentRun({
+              botId: current.botId,
+              canonicalSessionKey: current.sessionKey,
+              bcsRunId: runId,
+              agentRunId,
+            });
+          }
         },
       },
     });
 
     const settledContext = runContexts.get(runId);
     if (!settledContext) {
-      await cleanupRunContext(runId, log);
+      await cleanupRunContext(runId, log, true);
       log?.info?.(`[BCS] Dispatcher settled after terminal lifecycle for run_id=${runId}`);
       return;
     }
     if (abortController.signal.aborted) {
-      await cleanupRunContext(runId, log);
+      // AbortController only confirms that cancellation was requested. Keep
+      // the owner until a terminal lifecycle event or the terminal timeout.
       return;
     }
 
@@ -1591,7 +1689,7 @@ export async function handleChatSend(
         allowDeliveredTextFallback: true,
         finalDeliveredPartsCount: finalDeliveredParts.length,
       });
-      await cleanupRunContext(runId, log);
+      await cleanupRunContext(runId, log, true);
       return;
     }
 
@@ -1629,7 +1727,10 @@ export async function handleChatSend(
         attachmentError?.code,
       );
     }
-    await cleanupRunContext(runId, log);
+    const failedContext = runContexts.get(runId);
+    if (failedContext?.terminalState !== 'aborted') {
+      await cleanupRunContext(runId, log);
+    }
   }
 }
 
@@ -1818,6 +1919,7 @@ export async function handleChatInject(
   account: ResolvedBcsAccount,
   log?: { info: (...args: unknown[]) => void; warn: (...args: unknown[]) => void; error: (...args: unknown[]) => void },
   dataDir?: string,
+  coordinator: SessionMutationCoordinator = defaultSessionMutationCoordinator,
 ): Promise<void> {
   const params = request.params as unknown as ChatInjectParams;
   const bcsGroupId = params.bcs_group_id;
@@ -1855,9 +1957,6 @@ export async function handleChatInject(
   const ctxInfo = sessionContext ? extractGroupContext(sessionContext) : {};
   log?.info?.(`chat.inject from ${fromDisplayName} in ${bcsGroupId} (observe only): ${preview}`, ctxInfo);
 
-  // ACK immediately - no response needed for inject
-  client.sendResponse(request.id, true, {});
-
   // Record into OpenClaw session and inject message via gateway
   try {
     const rt = getBcsRuntime();
@@ -1877,6 +1976,19 @@ export async function handleChatInject(
     if (bcsGroupId) {
       sessionKeyToGroupId.set(route.sessionKey, bcsGroupId);
       groupIdToSessionKey.set(bcsGroupId, route.sessionKey);
+    }
+
+    const admission = await coordinator.waitForInject({
+      botId: account.botId,
+      canonicalSessionKey: route.sessionKey,
+    }, DEFAULT_INJECT_WAIT_TIMEOUT_MS);
+    if (admission.status !== 'ready') {
+      client.sendResponse(request.id, false, undefined, {
+        code: admission.status === 'timed_out' ? 'SESSION_BUSY' : 'GATEWAY_RESTARTED',
+        message: admission.reason,
+        retryable: admission.status === 'timed_out',
+      });
+      return;
     }
 
     // Track client reference and manager-worker context for task group tools
@@ -1954,14 +2066,34 @@ export async function handleChatInject(
       log,
     });
     if (transcriptPath && injected.messageId) {
-      rewriteInjectedTranscriptMessage({
+      if (!rewriteInjectedTranscriptMessage({
         transcriptPath,
         messageId: injected.messageId,
         log,
+      })) {
+        client.sendResponse(request.id, false, undefined, {
+          code: 'TRANSCRIPT_WRITE_FAILED',
+          message: 'Injected transcript message could not be confirmed',
+          retryable: true,
+        });
+        return;
+      }
+    } else if (!injected.messageId) {
+      client.sendResponse(request.id, false, undefined, {
+        code: 'INJECTION_UNCONFIRMED',
+        message: 'OpenClaw did not return a message_id for chat.inject',
+        retryable: false,
       });
+      return;
     }
+    client.sendResponse(request.id, true, { message_id: injected.messageId });
   } catch (err) {
     log?.warn?.(`chat.inject: error: ${err instanceof Error ? err.message : String(err)}`);
+    client.sendResponse(request.id, false, undefined, {
+      code: 'INJECTION_FAILED',
+      message: err instanceof Error ? err.message : String(err),
+      retryable: true,
+    });
   }
 }
 
@@ -2287,21 +2419,62 @@ export function abortAllStreams(): void {
   for (const runId of [ ...runContexts.keys() ]) {
     void cleanupRunContext(runId);
   }
-  activeStreams.clear();
-  runContexts.clear();
-  bcsRunIdByAgentRunId.clear();
-  visibleReplyByRunId.clear();
-  pendingRouteByRunId.clear();
-  pendingRouteBySessionKey.clear();
-  activeRunIdForSession.clear();
-  terminalRuns.clear();
-  sessionKeyToGroupId.clear();
-  sessionKeyToBcsSessionId.clear();
-  sessionKeyToRouteScope.clear();
-  groupIdToSessionKey.clear();
-  sessionRoutingMode.clear();
-  sessionKeyToClient.clear();
-  sessionTaskGroupInfo.clear();
+
+  const retainedRunIds = new Set(runContexts.keys());
+  const retainedSessionKeys = new Set(
+    [ ...runContexts.values() ]
+      .map(context => context.sessionKey)
+      .filter((sessionKey): sessionKey is string => Boolean(sessionKey)),
+  );
+  const retainedAgentRunIds = new Set(
+    [ ...runContexts.values() ]
+      .map(context => context.agentRunId)
+      .filter((agentRunId): agentRunId is string => Boolean(agentRunId)),
+  );
+
+  for (const runId of activeStreams.keys()) {
+    if (!retainedRunIds.has(runId)) activeStreams.delete(runId);
+  }
+  for (const runId of visibleReplyByRunId.keys()) {
+    if (!retainedRunIds.has(runId)) visibleReplyByRunId.delete(runId);
+  }
+  for (const runId of pendingRouteByRunId.keys()) {
+    if (!retainedRunIds.has(runId)) pendingRouteByRunId.delete(runId);
+  }
+  for (const [agentRunId, runId] of bcsRunIdByAgentRunId) {
+    if (!retainedAgentRunIds.has(agentRunId) || !retainedRunIds.has(runId)) {
+      bcsRunIdByAgentRunId.delete(agentRunId);
+    }
+  }
+  for (const [sessionKey, runId] of activeRunIdForSession) {
+    if (!retainedSessionKeys.has(sessionKey) || !retainedRunIds.has(runId)) {
+      activeRunIdForSession.delete(sessionKey);
+    }
+  }
+  for (const sessionKey of pendingRouteBySessionKey.keys()) {
+    if (!retainedSessionKeys.has(sessionKey)) pendingRouteBySessionKey.delete(sessionKey);
+  }
+  for (const sessionKey of sessionKeyToGroupId.keys()) {
+    if (!retainedSessionKeys.has(sessionKey)) sessionKeyToGroupId.delete(sessionKey);
+  }
+  for (const sessionKey of sessionKeyToBcsSessionId.keys()) {
+    if (!retainedSessionKeys.has(sessionKey)) sessionKeyToBcsSessionId.delete(sessionKey);
+  }
+  for (const sessionKey of sessionKeyToRouteScope.keys()) {
+    if (!retainedSessionKeys.has(sessionKey)) sessionKeyToRouteScope.delete(sessionKey);
+  }
+  for (const sessionKey of sessionKeyToClient.keys()) {
+    if (!retainedSessionKeys.has(sessionKey)) sessionKeyToClient.delete(sessionKey);
+  }
+  for (const sessionKey of sessionTaskGroupInfo.keys()) {
+    if (!retainedSessionKeys.has(sessionKey)) sessionTaskGroupInfo.delete(sessionKey);
+  }
+  for (const [groupId, sessionKey] of groupIdToSessionKey) {
+    if (!retainedSessionKeys.has(sessionKey)) groupIdToSessionKey.delete(groupId);
+  }
+  for (const sessionKey of sessionRoutingMode.keys()) {
+    if (!retainedSessionKeys.has(sessionKey)) sessionRoutingMode.delete(sessionKey);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2804,7 +2977,7 @@ export function initAgentEventsSubscription(log?: {
       log?.warn?.(
         `[BCS] Dropped non-conformant V3 agent event: runId=${evt.runId}, stream=${evt.stream}`,
       );
-      if (terminalOutcome) void cleanupRunContext(resolvedRunId, log);
+      if (terminalOutcome) void cleanupRunContext(resolvedRunId, log, true);
       return true;
     }
 
@@ -2812,7 +2985,7 @@ export function initAgentEventsSubscription(log?: {
     // emitted it, suppress this trailing lifecycle frame instead of sending an
     // event that BCS must reject as terminal.
     if (terminalOutcome && context.finalSent) {
-      void cleanupRunContext(resolvedRunId, log);
+      void cleanupRunContext(resolvedRunId, log, true);
       return true;
     }
 
@@ -2833,7 +3006,7 @@ export function initAgentEventsSubscription(log?: {
           `agent lifecycle ${stringField(evt.data, 'phase') ?? 'error'}`,
         );
       }
-      void cleanupRunContext(resolvedRunId, log);
+      void cleanupRunContext(resolvedRunId, log, true);
     }
     return true; // Indicate event was handled
   }) as (() => boolean) | null;
